@@ -59,7 +59,7 @@ typedef struct {
 
 static void ngx_http_limit_req_delay(ngx_http_request_t *r);
 static ngx_int_t ngx_http_limit_req_lookup(ngx_http_limit_req_limit_t *limit,
-    ngx_uint_t hash, ngx_str_t *key, ngx_uint_t *ep, ngx_uint_t account, ngx_uint_t *remaining);
+    ngx_uint_t hash, ngx_str_t *key, ngx_uint_t *ep, ngx_uint_t *remaining, ngx_uint_t account);
 static ngx_msec_t ngx_http_limit_req_account(ngx_http_limit_req_limit_t *limits,
     ngx_uint_t n, ngx_uint_t *ep, ngx_http_limit_req_limit_t **limit);
 static void ngx_http_limit_req_expire(ngx_http_limit_req_ctx_t *ctx,
@@ -165,8 +165,8 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
 {
     uint32_t                     hash;
     ngx_str_t                    key;
-    ngx_int_t                    rc, rate;
-    ngx_uint_t                   n, excess, remaining;
+    ngx_int_t                    rc;
+    ngx_uint_t                   n, excess, remaining, rate, burst;
     ngx_msec_t                   delay;
     ngx_http_limit_req_ctx_t    *ctx;
     ngx_http_limit_req_conf_t   *lrcf;
@@ -180,8 +180,10 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
     limits = lrcf->limits.elts;
 
     excess = 0;
-    remaining = 0;
-    rate = 0;
+    remaining = 0xffffffff;
+    rate = 1;
+    delay = 0;
+    burst = 0;
 
     rc = NGX_DECLINED;
 
@@ -190,6 +192,7 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
 #endif
 
     for (n = 0; n < lrcf->limits.nelts; n++) {
+        ngx_uint_t l_remaining = 0;
 
         limit = &limits[n];
 
@@ -215,8 +218,8 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
 
         ngx_shmtx_lock(&ctx->shpool->mutex);
 
-        rc = ngx_http_limit_req_lookup(limit, hash, &key, &excess,
-                                       (n == lrcf->limits.nelts - 1), &remaining);
+        rc = ngx_http_limit_req_lookup(limit, hash, &key, &excess, &l_remaining,
+                                       (n == lrcf->limits.nelts - 1));
 
         ngx_shmtx_unlock(&ctx->shpool->mutex);
 
@@ -224,23 +227,31 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
                        "limit_req[%ui]: %i %ui.%03ui",
                        n, rc, excess / 1000, excess % 1000);
 
-        
-        rate = ctx->rate;
-        
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                       "limit_req[%ui]: %i excess=%ui rate=%ui "
+                       "ctx_rate=%ui remaining=%ui l_remaining=%ui burst=%ui",
+                       n, rc, excess, rate, 
+                      ctx->rate, remaining, l_remaining, limit->burst );
+
+        /* Get the lowes remaining value. */
+        if (remaining == 0xffffffff ||
+            remaining > (l_remaining + limit->burst) ||
+            ( limit->burst && excess > limit->burst)
+        ){
+            rate = ctx->rate;
+            remaining = l_remaining + limit->burst;
+            burst = limit->burst;
+        }
+
         if (rc != NGX_AGAIN) {
             break;
         }
     }
-    
-
-                        
-                                // <iogg
-    if (1 || r->main->limit_req_set == 0) {
-
+    /** begin header addition */
+    if (r->main->limit_req_set == 0) {
+                                /* subsecond rates should be expressed with a x-ratelimit-reset > 1 */
                                 ngx_int_t limit = (rate < 1000 ? 1 : rate / 1000);
-                                ngx_int_t limit_r = (rate < 1000 ? 1 : 1 + remaining / 1000);
-                                
-                                
+                                ngx_int_t limit_r = (rate < 1000 ? 1 : remaining / 1000);
                                 if (1) {
                                     ngx_table_elt_t  *h;
 
@@ -251,7 +262,7 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
 
                                     h->hash = 1;
                                     h->key = (ngx_str_t) ngx_string("x-ratelimit-limit");
-                                    
+
                                     ngx_buf_t *b = ngx_create_temp_buf(r->pool, 256);
                                     if (b == NULL) {
                                         return NGX_ERROR;
@@ -280,10 +291,11 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
                                     if (b == NULL) {
                                         return NGX_ERROR;
                                     }
-                                    b->last = ngx_sprintf(b->last, "%d, %d",
-                                                        
-                                                          (int) excess > 100 ? 0 : ngx_min(limit_r, limit),
-                                                          (int) excess
+                                    b->last = ngx_sprintf(b->last, "%d, excess=%ui;burst=%ui;remaining=%ui",
+                                                          ngx_min(limit_r, limit),
+                                                          excess,
+                                                          burst,
+                                                          remaining
                                                          );
                                     h->value.data = b->pos;
                                     h->value.len = b->last - b->pos;
@@ -305,15 +317,17 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
                                     if (b == NULL) {
                                         return NGX_ERROR;
                                     }
-                                    b->last = ngx_sprintf(b->last, "%d", (int) (rate < 1000 ? 1000 / rate: 1));
+                                    b->last = ngx_sprintf(b->last, "%d",
+                                                          (int) (rate < 1000 ? 1000 / rate: 1)
+                                    );
                                     h->value.data = b->pos;
                                     h->value.len = b->last - b->pos;
                                     
                                 }
                     }
-                                // </iogg
+    /** end header addition */
 
-    
+
     if (rc == NGX_DECLINED) {
         return NGX_DECLINED;
     }
@@ -329,8 +343,7 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
                         lrcf->dry_run ? ", dry run" : "",
                         excess / 1000, excess % 1000,
                         remaining,
-                        &limit->shm_zone->shm.name
-                         );
+                        &limit->shm_zone->shm.name);
 
         }
 
@@ -466,7 +479,7 @@ ngx_http_limit_req_rbtree_insert_value(ngx_rbtree_node_t *temp,
 
 static ngx_int_t
 ngx_http_limit_req_lookup(ngx_http_limit_req_limit_t *limit, ngx_uint_t hash,
-    ngx_str_t *key, ngx_uint_t *ep, ngx_uint_t account, ngx_uint_t *remaining)
+    ngx_str_t *key, ngx_uint_t *ep, ngx_uint_t *remaining, ngx_uint_t account)
 {
     size_t                      size;
     ngx_int_t                   rc, excess;
@@ -514,8 +527,11 @@ ngx_http_limit_req_lookup(ngx_http_limit_req_limit_t *limit, ngx_uint_t hash,
                 ms = 0;
             }
 
+            /**
+             * The last `1000` is the request weight.
+             */
             excess = lr->excess - ctx->rate * ms / 1000 + 1000;
-                       
+
             if (excess < 0) {
                 *remaining = -excess;
                 excess = 0;
