@@ -125,7 +125,7 @@ static ngx_command_t  ngx_http_limit_req_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_limit_req_conf_t, dry_run),
       NULL },
-      
+
       ngx_null_command
 };
 
@@ -166,7 +166,8 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
     uint32_t                     hash;
     ngx_str_t                    key;
     ngx_int_t                    rc;
-    ngx_uint_t                   n, excess, remaining, rate, burst;
+    ngx_uint_t                   n, excess;
+    ngx_uint_t                   min_remaining, remaining, rate, burst;
     ngx_msec_t                   delay;
     ngx_http_limit_req_ctx_t    *ctx;
     ngx_http_limit_req_conf_t   *lrcf;
@@ -180,7 +181,8 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
     limits = lrcf->limits.elts;
 
     excess = 0;
-    remaining = 0xffffffff;
+    min_remaining = 0xffffffff;
+    remaining = 0;
     rate = 1;
     delay = 0;
     burst = 0;
@@ -192,7 +194,6 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
 #endif
 
     for (n = 0; n < lrcf->limits.nelts; n++) {
-        ngx_uint_t l_remaining = 0;
 
         limit = &limits[n];
 
@@ -218,7 +219,7 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
 
         ngx_shmtx_lock(&ctx->shpool->mutex);
 
-        rc = ngx_http_limit_req_lookup(limit, hash, &key, &excess, &l_remaining,
+        rc = ngx_http_limit_req_lookup(limit, hash, &key, &excess, &remaining,
                                        (n == lrcf->limits.nelts - 1));
 
         ngx_shmtx_unlock(&ctx->shpool->mutex);
@@ -229,17 +230,17 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
 
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                        "limit_req[%ui]: %i excess=%ui rate=%ui "
-                       "ctx_rate=%ui remaining=%ui l_remaining=%ui burst=%ui",
-                       n, rc, excess, rate, 
-                      ctx->rate, remaining, l_remaining, limit->burst );
+                       "ctx_rate=%ui remaining=%ui remaining=%ui burst=%ui",
+                       n, rc, excess, rate,
+                      ctx->rate, min_remaining, remaining, limit->burst );
 
-        /* Get the lowes remaining value. */
-        if (remaining == 0xffffffff ||
-            remaining > (l_remaining + limit->burst) ||
-            ( limit->burst && excess > limit->burst)
+        /* Get the lowest remaining value. We should even get values below quotas. */
+        if (min_remaining == 0xffffffff ||
+            min_remaining > (remaining + limit->burst) ||
+            (limit->burst && excess > limit->burst)
         ){
             rate = ctx->rate;
-            remaining = l_remaining + limit->burst;
+            min_remaining = remaining + limit->burst;
             burst = limit->burst;
         }
 
@@ -251,7 +252,7 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
     if (r->main->limit_req_set == 0) {
                                 /* subsecond rates should be expressed with a x-ratelimit-reset > 1 */
                                 ngx_int_t limit = (rate < 1000 ? 1 : rate / 1000);
-                                ngx_int_t limit_r = (rate < 1000 ? 1 : remaining / 1000);
+                                ngx_int_t limit_r = (rate < 1000 ? 1 : min_remaining / 1000);
                                 if (1) {
                                     ngx_table_elt_t  *h;
 
@@ -267,7 +268,7 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
                                     if (b == NULL) {
                                         return NGX_ERROR;
                                     }
-                                    b->last = ngx_sprintf(b->last, "%d, %d;window=%d", 
+                                    b->last = ngx_sprintf(b->last, "%d, %d;window=%d",
                                                           (int) (rate < 1000 ? 1 : rate / 1000),
                                                           (int) rate,
                                                           (int) 1000
@@ -286,7 +287,7 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
 
                                     h->hash = 1;
                                     h->key = (ngx_str_t) ngx_string("x-ratelimit-remaining");
-                                    
+
                                     ngx_buf_t *b = ngx_create_temp_buf(r->pool, 256);
                                     if (b == NULL) {
                                         return NGX_ERROR;
@@ -295,11 +296,11 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
                                                           ngx_min(limit_r, limit),
                                                           excess,
                                                           burst,
-                                                          remaining
+                                                          min_remaining
                                                          );
                                     h->value.data = b->pos;
                                     h->value.len = b->last - b->pos;
-                                    
+
                                 }
 
                                 if (1) {
@@ -312,7 +313,7 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
 
                                     h->hash = 1;
                                     h->key = (ngx_str_t) ngx_string("x-ratelimit-reset");
-                                    
+
                                     ngx_buf_t *b = ngx_create_temp_buf(r->pool, 256);
                                     if (b == NULL) {
                                         return NGX_ERROR;
@@ -322,7 +323,7 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
                                     );
                                     h->value.data = b->pos;
                                     h->value.len = b->last - b->pos;
-                                    
+
                                 }
                     }
     /** end header addition */
@@ -337,12 +338,12 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
     if (rc == NGX_BUSY || rc == NGX_ERROR) {
 
         if (rc == NGX_BUSY) {
-            
+
             ngx_log_error(lrcf->limit_log_level, r->connection->log, 0,
                         "limiting requests%s, excess: %ui.%03ui rem=%d by zone \"%V\" ",
                         lrcf->dry_run ? ", dry run" : "",
                         excess / 1000, excess % 1000,
-                        remaining,
+                        min_remaining,
                         &limit->shm_zone->shm.name);
 
         }
