@@ -235,13 +235,18 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
                       ctx->rate, min_remaining, remaining, limit->burst );
 
         /* Get the lowest remaining value. We should even get values below quotas. */
-        if (min_remaining == 0xffffffff ||
-            min_remaining > (remaining + limit->burst) ||
-            (limit->burst && excess > limit->burst)
+        if (min_remaining == 0xffffffff
+            || min_remaining + excess > remaining + limit->burst
+            // || (limit->burst && excess >= limit->burst)
         ){
             rate = ctx->rate;
-            min_remaining = remaining + limit->burst;
             burst = limit->burst;
+
+            if (remaining + limit->burst < excess) {
+                min_remaining = 0;
+            } else {
+                min_remaining = remaining + limit->burst - excess;
+            }
         }
 
         if (rc != NGX_AGAIN) {
@@ -268,10 +273,11 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
                                     if (b == NULL) {
                                         return NGX_ERROR;
                                     }
-                                    b->last = ngx_sprintf(b->last, "%d, %d;window=%d",
+                                    b->last = ngx_sprintf(b->last, "%d, %d;window=%d;burst=%ui",
                                                           (int) (rate < 1000 ? 1 : rate / 1000),
                                                           (int) rate,
-                                                          (int) 1000
+                                                          (int) 1000,
+                                                          burst
                                                          );
                                     h->value.data = b->pos;
                                     h->value.len = b->last - b->pos;
